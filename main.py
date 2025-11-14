@@ -596,7 +596,7 @@ if __name__ == "__main__":
     
     # Initialize and load data
     comparison = AutoKerasModelComparison(
-        train_path='1763087628187_train.csv',
+        train_path='train.csv',
         test_path='test.csv'
     )
     
