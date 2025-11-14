@@ -76,24 +76,48 @@ class AutoKerasModelComparison:
         X_train_full = train_clean[self.feature_cols].values
         y_train_full = train_clean[target].values
         
-        # Time series split: use last 20% for validation
-        split_idx = int(len(X_train_full) * 0.8)
-        X_train, X_val = X_train_full[:split_idx], X_train_full[split_idx:]
-        y_train, y_val = y_train_full[:split_idx], y_train_full[split_idx:]
+        # Check if we have enough data for the lookback window
+        min_required_samples = lookback + 10  # Need at least lookback + some validation samples
+        if len(X_train_full) < min_required_samples:
+            print(f"\n⚠️  WARNING: Dataset too small!")
+            print(f"   Current samples: {len(X_train_full)}")
+            print(f"   Required minimum: {min_required_samples}")
+            print(f"   Adjusting lookback window to fit available data...")
+            lookback = max(2, len(X_train_full) // 3)  # Use 1/3 of data as lookback
+            print(f"   New lookback: {lookback}")
         
-        # Scale features
-        X_train_scaled = self.scaler_features.fit_transform(X_train)
-        X_val_scaled = self.scaler_features.transform(X_val)
+        # Scale ALL features first (before splitting for time series)
+        X_scaled_full = self.scaler_features.fit_transform(X_train_full)
+        
+        # Create sequences BEFORE splitting to maximize data usage
+        X_seq_full, y_seq_full = self.create_sequences(X_scaled_full, y_train_full, lookback)
+        
+        if len(X_seq_full) == 0:
+            raise ValueError(f"Not enough data to create sequences! Need at least {lookback + 1} samples, got {len(X_train_full)}")
+        
+        # Now split the sequences (time series split: use last 20% for validation)
+        split_idx = int(len(X_seq_full) * 0.8)
+        if split_idx == 0:
+            split_idx = max(1, len(X_seq_full) - 1)  # Ensure at least 1 training sample
+        
+        X_train_lstm = X_seq_full[:split_idx]
+        X_val_lstm = X_seq_full[split_idx:]
+        y_train_lstm = y_seq_full[:split_idx]
+        y_val_lstm = y_seq_full[split_idx:]
+        
+        # For XGBoost, we also need non-sequence data
+        # Use the same indices from the sequences
+        X_train = X_scaled_full[lookback:lookback+len(X_train_lstm)]
+        X_val = X_scaled_full[lookback+len(X_train_lstm):lookback+len(X_train_lstm)+len(X_val_lstm)]
+        y_train = y_train_lstm
+        y_val = y_val_lstm
         
         print(f"\n📈 Training/Validation Split:")
-        print(f"  - Training samples: {len(X_train)} (80%)")
-        print(f"  - Validation samples: {len(X_val)} (20%)")
-        
-        # Create sequences for LSTM
-        X_train_lstm, y_train_lstm = self.create_sequences(X_train_scaled, y_train, lookback)
-        X_val_lstm, y_val_lstm = self.create_sequences(X_val_scaled, y_val, lookback)
-        
-        print(f"  - LSTM sequences (lookback={lookback}): {X_train_lstm.shape}")
+        print(f"  - Total sequences created: {len(X_seq_full)}")
+        print(f"  - Training sequences: {len(X_train_lstm)} (80%)")
+        print(f"  - Validation sequences: {len(X_val_lstm)} (20%)")
+        print(f"  - LSTM sequences shape: {X_train_lstm.shape}")
+        print(f"    (samples, timesteps, features) = ({X_train_lstm.shape[0]}, {X_train_lstm.shape[1]}, {X_train_lstm.shape[2]})")
         
         # === TEST DATA PREPARATION ===
         test_clean = self.test_df.copy()
@@ -128,8 +152,7 @@ class AutoKerasModelComparison:
         X_test_scaled = self.scaler_features.transform(X_test)
         
         # Create sequences for LSTM test data
-        # For test set, we need to handle the sequence creation differently
-        # since we don't have future targets
+        # Pad with last training samples if needed
         if len(X_test_scaled) >= lookback:
             X_test_lstm = []
             for i in range(lookback - 1, len(X_test_scaled)):
@@ -138,7 +161,7 @@ class AutoKerasModelComparison:
             test_indices = np.arange(lookback - 1, len(X_test_scaled))
         else:
             # If test set is smaller than lookback, pad with training data
-            combined = np.vstack([X_train_scaled[-lookback:], X_test_scaled])
+            combined = np.vstack([X_scaled_full[-lookback:], X_test_scaled])
             X_test_lstm = []
             for i in range(lookback - 1, len(combined)):
                 X_test_lstm.append(combined[i-lookback+1:i+1])
@@ -153,8 +176,8 @@ class AutoKerasModelComparison:
         
         return {
             # Training data
-            'X_train': X_train_scaled,
-            'X_val': X_val_scaled,
+            'X_train': X_train,
+            'X_val': X_val,
             'y_train': y_train,
             'y_val': y_val,
             'X_train_lstm': X_train_lstm,
@@ -167,18 +190,19 @@ class AutoKerasModelComparison:
             'test_indices': test_indices,
             'test_df': test_clean,
             # Metadata
-            'feature_cols': self.feature_cols
+            'feature_cols': self.feature_cols,
+            'lookback': lookback
         }
     
     def create_sequences(self, X, y, lookback):
-        """Create sequences for LSTM"""
+        """Create sequences for LSTM - returns 3D array (samples, timesteps, features)"""
         X_seq, y_seq = [], []
         for i in range(lookback, len(X)):
             X_seq.append(X[i-lookback:i])
             y_seq.append(y[i])
         return np.array(X_seq), np.array(y_seq)
     
-    def train_autokeras_lstm(self, data, max_trials=20, epochs=50):
+    def train_autokeras_lstm(self, data, max_trials=20, epochs=500):
         """Train LSTM using AutoKeras for automatic hyperparameter tuning"""
         print("\n" + "="*70)
         print("🤖 Training LSTM Model with AutoKeras AutoML")
@@ -187,11 +211,35 @@ class AutoKerasModelComparison:
         print("AutoKeras will search for optimal LSTM architecture...")
         print("This may take several minutes...\n")
         
-        # Create AutoKeras TimeseriesForecaster
-        lstm_auto = ak.TimeseriesForecaster(
-            lookback=data['X_train_lstm'].shape[1],
-            predict_from=1,
-            predict_until=1,
+        # Debug: Print shapes
+        print(f"🔍 Debug - Input data shapes:")
+        print(f"   X_train_lstm: {data['X_train_lstm'].shape}")
+        print(f"   y_train_lstm: {data['y_train_lstm'].shape}")
+        print(f"   X_val_lstm: {data['X_val_lstm'].shape}")
+        print(f"   y_val_lstm: {data['y_val_lstm'].shape}")
+        
+        # Verify we have 3D data
+        if len(data['X_train_lstm'].shape) != 3:
+            raise ValueError(f"Expected 3D input for LSTM, got shape {data['X_train_lstm'].shape}")
+        
+        timesteps = data['X_train_lstm'].shape[1]
+        features = data['X_train_lstm'].shape[2]
+        
+        print(f"\n📐 LSTM Input Configuration:")
+        print(f"   Timesteps (lookback): {timesteps}")
+        print(f"   Features per timestep: {features}")
+        
+        # Use AutoModel with custom input/output
+        input_node = ak.Input(shape=(timesteps, features))
+        
+        # Let AutoKeras search for best architecture
+        output_node = ak.RNNBlock(return_sequences=False)(input_node)
+        output_node = ak.RegressionHead()(output_node)
+        
+        # Create the AutoModel
+        lstm_auto = ak.AutoModel(
+            inputs=input_node,
+            outputs=output_node,
             max_trials=max_trials,
             loss='mse',
             metrics=['mae'],
@@ -202,29 +250,29 @@ class AutoKerasModelComparison:
             seed=42
         )
         
-        # Reshape data for AutoKeras (batch, features, timesteps)
-        X_train_ak = np.transpose(data['X_train_lstm'], (0, 2, 1))
-        X_val_ak = np.transpose(data['X_val_lstm'], (0, 2, 1))
-        
         # Train the model
         lstm_auto.fit(
-            X_train_ak,
+            data['X_train_lstm'],
             data['y_train_lstm'],
-            validation_data=(X_val_ak, data['y_val_lstm']),
+            validation_data=(data['X_val_lstm'], data['y_val_lstm']),
             epochs=epochs,
-            callbacks=[EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)]
+            callbacks=[EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1)]
         )
         
         # Get the best model
         self.lstm_model = lstm_auto.export_model()
         
         # Get best hyperparameters
-        best_trial = lstm_auto.tuner.oracle.get_best_trials(1)[0]
-        self.best_lstm_params = best_trial.hyperparameters.values
-        
-        print("\n✅ Best LSTM model found!")
-        print(f"   Best validation loss: {best_trial.score:.6f}")
-        print(f"   Best hyperparameters: {self.best_lstm_params}")
+        try:
+            best_trial = lstm_auto.tuner.oracle.get_best_trials(1)[0]
+            self.best_lstm_params = best_trial.hyperparameters.values
+            print("\n✅ Best LSTM model found!")
+            print(f"   Best validation loss: {best_trial.score:.6f}")
+            print(f"   Best hyperparameters: {self.best_lstm_params}")
+        except:
+            self.best_lstm_params = "AutoKeras parameters (see model architecture)"
+            print("\n✅ Best LSTM model found!")
+            print(f"   Model trained successfully with AutoKeras optimization")
         
         return lstm_auto
     
@@ -296,9 +344,8 @@ class AutoKerasModelComparison:
         print("\n1️⃣  VALIDATION SET PERFORMANCE:")
         print("-" * 70)
         
-        # LSTM predictions on validation
-        X_val_lstm_reshaped = np.transpose(data['X_val_lstm'], (0, 2, 1))
-        lstm_val_preds = self.lstm_model.predict(X_val_lstm_reshaped, verbose=0).flatten()
+        # LSTM predictions on validation - NO TRANSPOSE NEEDED
+        lstm_val_preds = self.lstm_model.predict(data['X_val_lstm'], verbose=0).flatten()
         
         # XGBoost predictions on validation
         xgb_val_preds = self.xgb_model.predict(data['X_val'])
@@ -327,9 +374,8 @@ class AutoKerasModelComparison:
         print("\n\n2️⃣  TEST SET PREDICTIONS:")
         print("-" * 70)
         
-        # LSTM predictions on test
-        X_test_lstm_reshaped = np.transpose(data['X_test_lstm'], (0, 2, 1))
-        lstm_test_preds = self.lstm_model.predict(X_test_lstm_reshaped, verbose=0).flatten()
+        # LSTM predictions on test - NO TRANSPOSE NEEDED
+        lstm_test_preds = self.lstm_model.predict(data['X_test_lstm'], verbose=0).flatten()
         
         # XGBoost predictions on test
         xgb_test_preds = self.xgb_model.predict(data['X_test'])
@@ -609,7 +655,7 @@ if __name__ == "__main__":
     
     # Train LSTM with AutoKeras
     print("\n[1/2] Training LSTM model...")
-    lstm_auto = comparison.train_autokeras_lstm(data, max_trials=20, epochs=50)
+    lstm_auto = comparison.train_autokeras_lstm(data, max_trials=20, epochs=500)
     
     # Train XGBoost with automated search
     print("\n[2/2] Training XGBoost model...")
